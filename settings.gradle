@@ -1,0 +1,12 @@
+pluginManagement {
+	repositories {
+		// 国内镜像优先（services.gradle.org / plugins.gradle.org 在本机不通）
+		maven { name = 'AliyunGradlePlugin'; url = 'https://maven.aliyun.com/repository/gradle-plugin' }
+		maven { name = 'AliyunPublic'; url = 'https://maven.aliyun.com/repository/public' }
+		maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+		mavenCentral()
+		gradlePluginPortal()
+	}
+}
+
+rootProject.name = 'nfhandshake'
