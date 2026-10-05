@@ -1,131 +1,215 @@
-# nfhandshake
+# nfhandshake 交接文档 —— Fabric 客户端进 NeoForge 服务器
 
-让 **Fabric 客户端** 进入 **NeoForge 服务器** 的模组。
-
-目标环境：Minecraft **1.21.11** + Fabric Loader **0.19.5** + Fabric API **0.141.6+1.21.11**
-配合 [ViaFabricPlus](https://github.com/ViaVersion/ViaFabricPlus) 做版本协议翻译（1.21.11 ↔ 1.21.1）。
-
----
-
-## 为什么需要它
-
-NeoForge 服务器在**配置阶段**会要求客户端声明自定义通道（`c:register`）。
-若服务端存在**非 optional** 的负载，而客户端没有声明，就会断线并提示：
-
-> You are trying to connect to a server that is running NeoForge, but you are not.
-> Please install NeoForge Version: ... to connect to this server.
-
-本模组解决两件事：
-
-1. **握手适配** —— 在配置阶段正确应答，让配置流程走完
-2. **静默丢弃** —— 丢弃服务端发来的非 `minecraft` 命名空间负载，不刷警告、不崩溃
+> 交接原因：上一轮会话上下文爆炸（2881 行日志，模型从 flash 连续切换到 reasoner/chat/minimax 仍未跑完）。
+> 本文把**已验证的事实**固化下来，新会话读这一份即可继续，不必重读历史。
+> 交接时间：2026-10-05
 
 ---
 
-## 已验证的结论（重要）
+## 0. 一句话现状
 
-### ✅ 可行的路线：声明服务端全部通道 + `optional=true`
+**"硬碰"方案握手层完全成功，但游戏阶段证伪了：** 机器人能骗过 NeoForge 协商（390 通道），但 `/server imm` 跨服重配置后，子服下发的 `registry_data`（NeoForge 模组注册表）被 mineflayer 的 1.21.1 解析器抛 `PartialReadError` 解崩，**流程卡死在 configuration 阶段，从未到达第二次 login/spawn**。没有踢人、没有断线——就是解不动模组数据。
+结论：**通用/Fabric 客户端靠伪造握手进 NeoForge 子服玩生存，在游戏数据层面走不通**（这恰好印证了原 README 没被推翻的那半句：模组负载需要对应解码器）。
 
-实测（用 mineflayer 机器人连真实 NeoForge 21.1.248 服务器）已完整通过：
+当前工作区的 Fabric mod（`nfhandshake`，空 `c:register` 装 vanilla）**两条路都被实测否定**。
 
-| 里程碑 | 结果 |
-|---|---|
-| 协商通过（收到 `neoforge:network`） | ✅ |
-| 配置阶段完成（`finish_configuration`） | ✅ |
-| 进入游戏（`login` 包） | ✅ |
-| 收到位置包、可操作 | ✅ |
-| `spawn` 事件（真正进入世界） | ✅ |
+### 0.1 实测铁证时间线（mc.mcme.uno, 离线账号 TextValue）
+```
+13:21:44  大厅 spawn #1（代理大厅，非 imm）
+13:21:47  发送 /server imm
+13:21:48  start_configuration   ← 子服要求重走配置
+13:21:48  回复 390 通道 → 协商通过 (neoforge:network 26606 B)  ✅ 握手再次成功
+13:21:48  select_known_packs / registry_data ×22
+13:21:48  PartialReadError (nbtMapper/SlotComponent)  ← 解模组注册表崩了
+……        此后到超时无任何包，无 login / 无 spawn #2 / 无踢人
+```
+- 证据文件：`bot/imm_trace.js`（诊断脚本）、`bot/imm_trace_result.json`、前一轮 `bot/count_spawn_result.json`（仅 1 次 spawn）、`bot/verify_network.bin`（大厅协商成功包）。
+- 关键判断变量：`negotiation PASSED` 只是配置**开始**；能否玩取决于 `registry_data` 之后能否收到 `finish_configuration` + 第二次 `login`+`spawn`，而这一步失败了。
 
-做法：把服务端的**全部通道**连同其**真实 version / flow** 一并返回，并把
-`optional` 置为 `true`。即伪装成一个"拥有全部通道的 NeoForge 客户端"。
+### 0.2 真正能玩生存的可行路径（按把握排序）
+1. **NeoForge 客户端直连**：你 `PonderSMP` 实例本就是 NeoForge 21.1.248，版本完全匹配，100% 能进 imm。
+2. **ViaFabricPlus 实测**：`1.21.11-Fabric 0.19.5` 实例已带 ViaFabricPlus 4.4.15，理论上能把未知负载当 passthrough——**需人手在该实例里实测进 imm 能否不崩**（机器人层面已证伪，但人手客户端 + VF+ 是另一回事）。
+3. 伪造握手：已证伪（见 0.1）。
 
-服务端通道表可用**错误驱动学习**获得：先发空表，从服务端返回的
-`flow.*.missing` / `version.mismatch` 报错中逐通道学出真实值，迭代几轮即可补齐。
+---
 
-### ❌ 不可行的路线：空 `c:register` 装 vanilla
+## 1. 目标（用户原话）
 
-NeoForge `PayloadRegistrar` 默认 `private boolean optional = false;`，且其注释明写：
+> 「啥玩意我只想进去玩生存而不是进不去在外面等着 我的意思是用fabric客户端进入neoforge服务器」
 
+即：**用 1.21.11 的 Fabric 客户端，进入 NeoForge 21.1.248（MC 1.21.1）的服务器玩生存。**
+不是用 NeoForge 客户端进（那个本来就能进），也不是"在外面等着"。
+
+---
+
+## 2. 目标服务器（已确认）
+
+| 项 | 值 | 证据 |
+|---|---|---|
+| 地址 | `mc.mcme.uno` | `iterate3.js:36` |
+| 子服务器 | `imm`（通过 `/server imm` 进入） | 实测日志 |
+| 加载器 | **NeoForge 21.1.248** | 服务器拒绝消息原文 |
+| MC 版本 | 1.21.1 | `PonderSMP.json` |
+| 代理 | BungeeCord/Velocity | 抓包见 `legacy:pnchat`、`pnban`、`floodgate:transfer`、`geyserextras:fog` |
+| 模组量 | 390 个自定义通道 | `learned.json` |
+
+服务器拒绝 vanilla 客户端的原话：
+```
+Unable to connect to imm: 你正在尝试连接一个安装了 NeoForge 的服务器，
+但是你没有安装。为了连接到此服务器，请安装 NeoForge 版本 21.1.248。
+```
+
+**关键陷阱**：大厅是 Forge-no-mods，发 `neoforge:register` 它不理；必须 `/server imm` 之后才进入真正的 NeoForge 子服。
+
+---
+
+## 3. 硬碰方案：已验证成功（核心资产）
+
+### 3.1 成功日志（原文，来自上一轮会话行 #1556）
+
+```
+04:54:12 === ROUND 4 (server query len 1)
+04:54:12 --> reply 390 channels, 378 with flow, 390 with version (15624 B)
+04:54:12 *** SUCCESS *** received neoforge:network -> negotiation PASSED
+```
+
+**服务器接受了机器人作为 NeoForge 客户端。**
+
+### 3.2 方法：错误驱动学习（4 轮）
+
+用 `mineflayer`（Node）连服务器，故意发错，从服务器报错里逐通道学出真实值：
+
+| 轮次 | 发送内容 | 服务器反馈 | 学到 |
+|---|---|---|---|
+| R1 | 390 个空通道 | — | 全部 **390 个通道 ID** |
+| R2 | `version=""`、无 flow | 390 个 `flow.*.missing` | **378 个 flow** |
+| R3 | 用学到的表 | `version.mismatch`（如 `moonlight` 要 `"10"`、`vista` 要 `"2"`） | 补齐 **version** |
+| R4 | 390 通道 + 真实 version/flow + `optional=true` | **✅ SUCCESS** | — |
+
+### 3.3 弹药：`learned.json`（390 通道，version/flow 零缺失）
+
+```json
+{
+  "create:toolbox_dispose_all":                     { "flowOrd": 0, "version": "6.0.10" },
+  "cookingforblockheads:request_selection_recipes":  { "flowOrd": 0, "version": "cookingforblockheads" },
+  "sable:stop_tracking_sub_level":                   { "flowOrd": 1, "version": "1" },
+  "refinedstorage:message":                          { "flowOrd": 1, "version": "2.0.9" }
+}
+```
+
+- `flowOrd`: `0` = SERVERBOUND，`1` = CLIENTBOUND
+- 统计：**SERVERBOUND 197 / CLIENTBOUND 181 / 其他 12**，**无 version 缺失 0**
+- 按 namespace：create 115、refinedstorage 55、simulated 37、waystones 23、sophisticatedcore 20、curios 17、quark 17、sable 16、computercraft 16、sophisticatedbackpacks 15……（共 24 个）
+
+### 3.4 关键代码（`iterate3.js:21`）
+
+```js
+buildComponent(c.id, c.version, c.flow, true)
+//                                    ^^^^ optional 硬编码 true
+```
+
+**把 390 个通道全部声明为 `optional=true`，但携带真实 version 和 flow。**
+这不是"伪装成 vanilla"，而是**伪装成一个拥有全部 390 通道的 NeoForge 客户端**。
+
+### 3.5 `success_network.bin`（26 KB）
+
+服务器协商通过后回发的**确认包**，内含 390 通道列表（UTF8 可见 `create:toolbox_dispose_all` 等）。是协商成功的物证。
+
+---
+
+## 4. 当前 Fabric mod：`nfhandshake` —— 此路已被证明不通
+
+位置：`F:\wish\Fab-Neo\src\main\java\net\fabneo\nfhandshake\`
+产物：`build/libs/nfhandshake-1.0.0.jar`（可正常构建，`BUILD SUCCESSFUL`）
+
+### 4.1 它做的事
+
+1. 配置阶段发送 **channels 为空集**的 `c:register`，企图让服务器归类为 `vanilla/other`
+2. 两个 Mixin（priority=1）在 `handleCustomPayload` HEAD 处丢弃非 `minecraft` 命名空间负载
+3. Netty 层 `NettyModdedPayloadFilter` 拦截
+
+### 4.2 为什么必被踢
+
+NeoForge `PayloadRegistrar.java:28` 默认 `private boolean optional = false;`，
+且 `:205` 注释明写：
 > If any non-optional payloads are missing during a connection attempt, the connection will fail.
 
-**只要服务端有一个非 optional 负载缺失就断线，这是服务端属性，客户端改不了。**
-当前仓库代码走的是这条路（空 channels），**用于参考协议结构，实际会被踢**。
+**服务端有 390 个通道，只要有一个非 optional 缺失就断线。这是服务端属性，客户端改不了。**
+→ 所以"空 channels 装 vanilla"必失败，实测也证实被踢。
+
+### 4.3 附带修正：原 README 的过时论断
+
+`README-原实现说明(被实测推翻).md` §2.3 称：
+> 客户端在协商前无从得知服务端的通道表……**实际不可行**。
+
+**这句被实测推翻**：通道表可以用错误驱动学习拿到（4 轮），协商也确实骗过了。
+（但该 README 的**映射考证部分仍然有效**，Mixin 注入点、Mojmap 行号都是对的。）
 
 ---
 
-## 当前代码状态
+## 5. 未完成的事（下一步）
 
-| 模块 | 说明 |
+1. **验证"协商通过后能否真正进入游戏"** ← 最关键未知数
+   协商过了 ≠ 能玩生存。后面还有配置阶段剩余任务
+   （`CommonVersionTask` / `CommonRegisterTask` 应答、注册表同步等）。
+   上一轮模型切换后没跑完。
+2. **把硬碰方案移植成 Fabric mod**
+   需发 15624 字节的 `neoforge:register` 查询包（`ModdedNetworkQueryPayload`），
+   而非当前的空 `c:register`。`learned.json` 是现成通道表。
+3. **决定客户端实例**
+   用户 `PonderSMP` 实例本身就是 NeoForge 21.1.248（版本完全匹配，本来能进）；
+   要"用 Fabric 客户端进"，应走 `1.21.11-Fabric 0.19.5`（48 mods）+ ViaFabricPlus。
+
+---
+
+## 6. 环境与工具（已核实可用）
+
+| 工具 | 路径 / 版本 |
 |---|---|
-| `NfHandshakeClient` | 入口：注册负载类型、配置阶段发送、注入 Netty 过滤器 |
-| `CommonRegisterPayload` | 复刻 NeoForge `c:register` 的线格式（VAR_INT / UTF8 / HashSet） |
-| `NettyModdedPayloadFilter` | Netty 层 `ChannelInboundHandlerAdapter`，丢弃非 `minecraft` 负载 |
-| `ClientCommonPacketListenerImplMixin`<br>`ClientConfigurationPacketListenerImplMixin` | 两个 `handleCustomPayload` 注入点，`priority = 1`，HEAD 处 `ci.cancel()` |
-| `ClientCommonPacketListenerImplAccessor`<br>`ConnectionAccessor` | 打开 `connection`、`channel` 私有字段 |
+| git | `F:\Git\cmd\git.exe`，2.55.0 |
+| node | `F:\Program Files\nodejs\node.exe`，v22.22.1 |
+| npm/npx | 随 node |
+| java | PATH 生效 `f:\java\java21`；另有 java8/11/17/22/25 |
+| gradle | **PATH 无**，但工作区自带 `tools\gradle-dist\gradle-9.7.1\bin\gradle.bat` |
+| gh | 2.100.0，**已登录 `yingfing`**，scopes: gist/read:org/repo/workflow |
+| 7z | `F:\Program Files\7-zip\7z.exe`（不支持 zstd） |
+| python | ⚠️ PATH 里是微软商店存根，**不可用**；真 Python `F:\Program Files\Python\python.exe` = 3.10.0 |
 
-⚠️ 当前实现发送的是 **空 channels 的 `c:register`**（即上表中"不可行"的路线）。
-要落地"可行路线"，需改为发送服务端完整通道表（version/flow 真实 + `optional=true`）。
-
----
-
-## 构建
-
-需要 **JDK 25**（Loom 1.18.2 的 classpath 依赖要求 JVM ≥ 25；编译目标为 Java 21）。
-
-若本机默认 JDK 不是 25，编辑 `gradle.properties` 取消注释并指定：
-
-```properties
-org.gradle.java.home=/path/to/your/jdk25
+**构建命令**（需 JVM ≥ 25，Loom 1.18.2 要求）：
+```powershell
+$env:JAVA_HOME='F:\java\java25'
+F:\wish\Fab-Neo\tools\gradle-dist\gradle-9.7.1\bin\gradle.bat -p F:\wish\Fab-Neo build --no-daemon
 ```
 
-然后：
-
-```bash
-./gradlew build          # 或用你自己的 gradle
+**跑机器人验证**：
+```powershell
+Set-Location F:\wish\Fab-Neo\bot
+$env:PROTO='1'
+& 'F:\Program Files\nodejs\node.exe' iterate3.js
 ```
 
-产物：`build/libs/nfhandshake-1.0.0.jar`
+---
 
-> 若 `services.gradle.org` 不通，可改用国内镜像源或本地 Gradle 发行版。
+## 7. 用户硬性约束（务必遵守）
+
+1. **不要全盘扫描磁盘**（用户给 Everything 正是为了防这个）。找文件一律先给目录，用 glob/grep 限定范围。
+2. **产生的东西全部留在工作区**，不要散落到电脑各处。
+3. 需要联网/写盘的操作（装包、推 GitHub）先征得同意。
 
 ---
 
-## 安装
+## 8. 文件索引
 
-把 jar 放进对应版本的 **mods 目录**（注意版本隔离，不是全局 mods）。
+| 路径 | 说明 |
+|---|---|
+| `README.md` | 本文件，交接主文档 |
+| `learned.json` | **390 通道表**（version/flow），硬碰弹药 |
+| `success_network.bin` | 协商通过后服务器回发的确认包（26 KB，物证） |
+| `iterate3.js` | 最后一版迭代脚本（发 390 通道 + optional=true） |
+| `README-原实现说明(被实测推翻).md` | 原 README；映射考证有效，§2.3 结论已被推翻 |
 
----
-
-## 关于协议考证
-
-本项目的 Mixin 注入点、字段/方法映射均取自 **Mojang 官方映射（mojmap）**，可自行复核：
-
-```
-net.minecraft.client.multiplayer.ClientCommonPacketListenerImpl -> hia
-    net.minecraft.network.Connection connection -> b
-    180:192:void handleCustomPayload(ClientboundCustomPayloadPacket) -> a
-
-net.minecraft.client.multiplayer.ClientConfigurationPacketListenerImpl -> hib
-    70:71:void handleCustomPayload(CustomPacketPayload) -> a
-
-net.minecraft.network.Connection -> wu
-    io.netty.channel.Channel channel -> k
-```
-
-另：`DiscardedPayload -> ace`、`CustomPacketPayload$Type -> acd$b`。
-1.21.11 对未知 ID 有 `DiscardedPayload` 回退，**不会**抛 `DecoderException`，
-因此在 `handleCustomPayload` 处取消即可，无需做解码前的字节级拦截。
-
----
-
-## 参考
-
-- [ViaFabricPlus](https://github.com/ViaVersion/ViaFabricPlus) —— 版本协议翻译
-- [NeoForge](https://github.com/neoforged/NeoForge) —— 服务端网络协议实现
-- [Fabric API](https://github.com/FabricMC/fabric-api) —— 事件与网络 API
-
----
-
-## 许可
-
-本项目用于学习与公益目的，欢迎改进与分发。
+原始材料仍在：
+- `F:\wish\Fab-Neo\bot\` — 完整机器人工具链（probe.js/iterate.js/learned_spec.json/failure_round*.bin）
+- `F:\wish\Fab-Neo\src\` — Fabric mod 源码
+- `F:\wish\Fab-Neo\ref\` — Mojmap、NeoForge 源码与字节码
+- `F:\wish\Fab-Neo\need\` — 需求文档（`2how to made.md` 里的代码**编译不过**，仅供参考）
