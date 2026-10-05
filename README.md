@@ -28,8 +28,8 @@
 
 ### 0.2 真正能玩生存的可行路径（按把握排序）
 1. **NeoForge 客户端直连**：你 `PonderSMP` 实例本就是 NeoForge 21.1.248，版本完全匹配，100% 能进 imm。
-2. **ViaFabricPlus 实测**：`1.21.11-Fabric 0.19.5` 实例已带 ViaFabricPlus 4.4.15，理论上能把未知负载当 passthrough——**需人手在该实例里实测进 imm 能否不崩**（机器人层面已证伪，但人手客户端 + VF+ 是另一回事）。
-3. 伪造握手：已证伪（见 0.1）。
+2. 伪造握手（机器人）：握手 + 进 imm 世界已攻克（见 §9），但游戏阶段 390 模组负载解码是另一堵墙，机器人侧玩不了生存。
+3. ~~ViaFabricPlus 方案~~：**已更正**——ViaFabricPlus 只是版本翻译（让你 1.21.11 客户端连 1.21.1 服务器），只过协议版本关，**不提供 NeoForge 模组负载兼容**。说它"自带 NeoForge 协议层"是错误推断，已撤回。纯 Fabric + VF+ 进 imm 玩生存不可行（游戏阶段模组负载绕不过）。
 
 ---
 
@@ -256,7 +256,8 @@ $env:PROTO='1'
 ### 9.4 若要继续（下一步具体路径）
 
 A. **把"主动 finish_configuration"固化成干净的 mineflayer patch**：在 `enterConfigState` 里，reconfiguration 场景（已有 play 状态）收到 `tags` 后客户端主动发 `finish_configuration` + 切 state。这样不依赖脚本 hack，且 mineflayer 内部状态机正确。
-B. **游戏阶段才是真正的墙**：进了 imm 之后，390 个模组的游戏负载（create/refinedstorage 等）mineflayer 完全不解码，世界能进但物品/方块/实体交互会错位。要"玩生存"还需在 mineflayer 里实现 NeoForge 的负载编解码——等于重造 ViaFabricPlus。机器人侧"进 imm 并保活"已达成；**人手用 `1.21.11-Fabric` + ViaFabricPlus 实例才是玩生存的可行路**（VF+ 自带 NeoForge 协议层）。
+B. **游戏阶段才是真正的墙**：进了 imm 之后，390 个模组的游戏负载（create/refinedstorage 等）mineflayer 完全不解码，世界能进但物品/方块/实体交互会错位。要"玩生存"还需在 mineflayer 里实现 NeoForge 的负载编解码。
+   ⚠️ 更正：之前写"人手用 1.21.11-Fabric + ViaFabricPlus 实例可行"是错误推断——**ViaFabricPlus 只做版本翻译，不提供 NeoForge 模组负载兼容**，不能让它进 imm 玩生存。玩生存真正匹配的是你的 NeoForge 客户端（PonderSMP 21.1.248）。
 
 ### 9.5 已对第三方库做的改动（保留，作为诊断/突破资产）
 
