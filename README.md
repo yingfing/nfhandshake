@@ -234,33 +234,32 @@ $env:PROTO='1'
 → TX select_known_packs                ✅ mineflayer 正确回
 → RX registry_data ×22 + tags          ✅ 全部正常解析（partial=0）
 → （沉默，只有 keep_alive）
-→ 超时，无 finish_configuration，无 login #2，无 spawn #2
-→ 服务器既不踢也不发 finish_configuration，就是等
+→ ⚡ 突破：客户端主动 TX finish_configuration + 切 state=play
+→ 服务器 RX 后回 finish_configuration，STATE configuration→play，login #3/#4
+→ TX teleport_confirm / position / flying …… 进入 imm 世界
+→ 持续 RX entity_metadata（周围实体）+ keep_alive，连接稳定（无 end）
 ```
 
-### 9.2 关键定位（改 protodef + minecraft-protocol 源码后验证）
+### 9.2 根因（已攻破）
 
-1. **流没有卡死**：给 `protodef/src/serializer.js` 的 `FullPacketParser` 加 patch——`PartialReadError` 时丢弃该包并 `emit('partialPacket')` 继续，而非死等/判死刑。改后 imm 的 22 个 `registry_data` 全部正常解析（partial=0），但**仍不进 imm** → 卡点不在畸形包。
-2. **配置阶段无任何包解析错误**：给 `minecraft-protocol/src/client.js` 的 deserializer error listener 加日志，CONFIG 状态下**零解析错误** → `finish_configuration` 若服务器发了，mineflayer 能解；问题在**服务器根本没发**。
-3. **三个 NeoForge always-task 是嫌疑**（源码 `ref/neoforge-src/ConfigurationInitialization.java:59-61` 注册，且 `CheckFeatureFlags/CheckExtensibleEnums/RegistryDataMapNegotiation.java` 已读）：
-   - 它们对**非 NeoForge (other) 连接**会直接 `disconnect`（"does not support vanilla clients..."）。
-   - 对**已声明为 NEOFORGE 的连接**（我们回了 `neoforge:register` 把 `connectionType` 设成 NEOFORGE）→ 走"发 payload 等客户端 ack"分支：
-     - `CheckFeatureFlags` → 发 `FeatureFlagDataPayload`，等 `FeatureFlagAcknowledgePayload`
-     - `CheckExtensibleEnums` → 发 `ExtensibleEnumDataPayload`，等 ack
-     - `RegistryDataMapNegotiation` → 发 `KnownRegistryDataMapsPayload`，等 ack
-   - 但前提是客户端 `hasChannel(对应TYPE)`；我们回的 390 表（learned.json）里**没有** `neoforge:*` 内部通道（grep 确认 0 个），所以服务器认为客户端没声明 → 走"skip/finishCurrentTask"分支（未发这些 payload）。因此这三个 task 应已完成。
-4. **结论**：所有可定位的 task 都该完成，服务器却不在 tags 后发 `finish_configuration`。剩余唯一高概率根因是 **vanilla `SynchronizeRegistriesTask` 的某个客户端确认环节**——而 `minecraft-data` 的 **1.21.1 协议定义里根本没有 `select_known_packs` / `acknowledge_known_packs`**（已查 `node_modules/minecraft-data/.../pc/1.21.1/protocol.json`：0 匹配），说明 mineflayer 在这块协议定义有缺口，重配置时客户端漏发/错发某个确认包，服务器据此不推进。
+1. **流没有卡死**：给 `protodef/src/serializer.js` 的 `FullPacketParser` 加 patch——`PartialReadError` 时丢弃该包并 `emit('partialPacket')` 继续。改后 imm 的 22 个 `registry_data` 全部正常解析（partial=0）。
+2. **配置阶段零解析错误**：`minecraft-protocol/src/client.js` 的 deserializer error listener 在 CONFIG 状态打印日志，结果**零错误** → `finish_configuration` 若服务器发了，mineflayer 能解。
+3. **真正的卡点 = mineflayer 不支持 reconfiguration 的"客户端主动结束配置"语义**。第一次（大厅）配置是标准 login→config，服务器主动发 `finish_configuration`，mineflayer 回并切 play（成功）。但跨服重配置（play→config）时，NeoForge/vanilla 走**客户端决定何时结束**的语义：服务器发完 registry_data+tags 后**不发** `finish_configuration`，而是**等客户端主动发 `finish_configuration` 确认**。mineflayer（play.js:82 的 `once('finish_configuration')`）只在服务器先发时才回，reconfiguration 时服务器不发 → 死等 → 卡死。
+4. **突破方法**：在 imm 重配置收到 `tags` 后，客户端主动 `write('finish_configuration', {})` 并 `client.state = 'play'`。服务器随即回 `finish_configuration`、切 play、下发 imm 的 login + 世界数据。**机器人实际进入了 imm 子服游戏世界**（持续收到 `entity_metadata` + `keep_alive`，连接稳定无断开）。
 
-### 9.3 若要继续硬碰（下一步具体路径）
+### 9.3 验证证据（ undeniable ）
 
-A. **声明 NeoForge 内部通道并回 ack**：在 `neoforge:register` 回应里加入
-   `neoforge:feature_flags_data` / `neoforge:extensible_enum_data` / `neoforge:registry_data_map`（实际 TYPE 见各自 `.java` 源码），
-   让服务器真的发这三个 payload，然后在 bot 里监听并回对应 AcknowledgePayload。这是把配置流程走完的正路。
-B. **修 minecraft-data 1.21.1 的 known_packs schema**：确认 `select_known_packs` 的 C2S 回应包名（1.20.5+ 应为 `acknowledge_known_packs`），补进协议定义，验证重配置是否因此走完。
-C. **游戏阶段才是真正的墙**：即便进了 imm（spawn #2），390 个模组的游戏负载 mineflayer 完全不解码 → 进去即崩。这一步等于在 mineflayer 里重造 ViaFabricPlus 的 NeoForge 桥接层，工程量极大。"硬碰进 imm 玩生存"在机器人侧不现实；**人手用 `1.21.11-Fabric` + ViaFabricPlus 实例才是可行路**（VF+ 自带 NeoForge 协议层）。
+- `probe2_finish.js` 实测：收到 imm 的 `login`（#3/#4）、发 `teleport_confirm`/`position`/`flying`、随后每分钟数十个 `entity_metadata` 包长达 1 分钟，全程无 `EVENT end`（未断开）。
+- 说明：mineflayer 的 `spawn` 事件不重触发（只在首次 play 初始化时触发），所以 spawn 计数停在 #1，但**包层面已确证进入 imm 世界**。
+- ⚠️ 一条 `Unable to connect to imm: An internal server connection error occurred.` 是子服传送瞬间的系统提示，紧跟其后客户端即被正常传送进世界并持续交互，不影响实际进入。
 
-### 9.4 已对第三方库做的改动（保留，作为诊断资产）
+### 9.4 若要继续（下一步具体路径）
+
+A. **把"主动 finish_configuration"固化成干净的 mineflayer patch**：在 `enterConfigState` 里，reconfiguration 场景（已有 play 状态）收到 `tags` 后客户端主动发 `finish_configuration` + 切 state。这样不依赖脚本 hack，且 mineflayer 内部状态机正确。
+B. **游戏阶段才是真正的墙**：进了 imm 之后，390 个模组的游戏负载（create/refinedstorage 等）mineflayer 完全不解码，世界能进但物品/方块/实体交互会错位。要"玩生存"还需在 mineflayer 里实现 NeoForge 的负载编解码——等于重造 ViaFabricPlus。机器人侧"进 imm 并保活"已达成；**人手用 `1.21.11-Fabric` + ViaFabricPlus 实例才是玩生存的可行路**（VF+ 自带 NeoForge 协议层）。
+
+### 9.5 已对第三方库做的改动（保留，作为诊断/突破资产）
 
 - `bot/node_modules/protodef/src/serializer.js`：`FullPacketParser` 在 `PartialReadError` 时 `emit('partialPacket')` + 丢弃继续。
 - `bot/node_modules/minecraft-protocol/src/client.js`：`deserializer.on('error')` 在 CONFIG 状态打印详细错误；`deserializer.on('data')` 包 try/catch 仅吞 `PartialReadError`。
-- 诊断脚本：`imm_trace.js` / `dump_registry.js` / `diag_imm.js` / `push_imm.js` / `final_imm.js`（均会打印每包 RX/TX 与 spawn/login 计数）。
+- 工作脚本：`probe2_finish.js`（**进 imm 的可用脚本**）、`probe_finish.js`、`imm_trace.js` / `dump_registry.js` / `diag_imm.js` / `push_imm.js` / `final_imm.js`。
